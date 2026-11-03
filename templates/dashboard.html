@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Image Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+
+<body>
+
+    <div class="container">
+
+        <h1>Image Processing Dashboard</h1>
+        <!-- Dashboard Summary Cards -->
+        <div class="summary-grid">
+
+            <div class="summary-card">
+                <h3>Total Uploaded Images</h3>
+                <p>{{ total_uploaded }}</p>
+            </div>
+
+            <div class="summary-card">
+                <h3>Total Processed Images</h3>
+                <p>{{ total_processed }}</p>
+            </div>
+
+            <div class="summary-card">
+                <h3>Total Storage Used</h3>
+                <p>{{ storage_mb }} MB</p>
+            </div>
+
+            <div class="summary-card">
+                <h3>Total Processing Operations</h3>
+                <p>{{ total_operations }}</p>
+            </div>
+
+        </div>
+
+
+        <!-- Original Uploaded Images -->
+        <h2>Uploaded Images</h2>
+
+        {% for image in images %}
+
+        <div class="image-card">
+            <h4>Original</h4>
+
+            <img src="{{ image.url }}" alt="Original image">
+
+            <p>{{ image.filename }}</p>
+            <form action="{{ url_for('delete_uploaded_image', filename=image.filename) }}" method="POST" onsubmit="return confirm('Are you sure you want to delete this image and all its processed versions?');">
+
+                <button type="submit" class="delete-button">
+        Delete Image
+    </button>
+
+            </form>
+            <form action="{{ url_for('process_uploaded_image', filename=image.filename) }}" method="POST">
+                <button type="submit">Process Image</button>
+            </form>
+        </div>
+
+        {% else %}
+        <p>{{ image.filename }}</p>
+        <p>No images available.</p>
+
+        {% endfor %}
+
+        <hr>
+
+        <!-- Before and After Comparison -->
+        <h2>Before & After Image Comparison</h2>
+
+        {% if comparison_groups %} {% for group in comparison_groups %}
+
+        <div class="comparison-section">
+
+            <h3>Original Image: {{ group.original.filename }}</h3>
+
+            <div class="comparison-grid">
+
+                <!-- Original Image -->
+                <div class="image-card">
+
+                    <h4>Original</h4>
+
+                    <img src="{{ group.original.url }}" alt="Original image">
+
+                    <p>{{ group.original.filename }}</p>
+                    <p>Dimensions: {{ group.original.dimensions }}</p>
+                    <p>File Size: {{ group.original.file_size }}</p>
+                    <p>Uploaded On: {{ group.original.date_time }}</p>
+                    <a href="{{ group.original.download_url }}">
+                        <button type="button">Download Original</button>
+                    </a>
+
+                </div>
+
+                <!-- Processed Images -->
+                {% for output in group.outputs %}
+
+                <div class="image-card">
+
+                    <h4>{{ output.operation }}</h4>
+
+                    <img src="{{ output.url }}" alt="{{ output.operation }}">
+
+                    <p>{{ output.filename }}</p>
+                    <p>Dimensions: {{ output.dimensions }}</p>
+                    <p>File Size: {{ output.file_size }}</p>
+                    <p>Processed On: {{ output.date_time }}</p>
+                    <p>Processed On: {{ output.date_time }}</p>
+                    <a href="{{ output.download_url }}">
+                        <button type="button">
+                                Download {{ output.operation }}
+                            </button>
+                    </a>
+
+                </div>
+
+                {% endfor %}
+
+            </div>
+
+        </div>
+
+        {% endfor %} {% else %}
+
+        <p>No image comparisons available yet.</p>
+
+        {% endif %}
+
+        <br>
+
+        <a href="/">Back to Home</a>
+
+    </div>
+
+</body>
+
+</html>

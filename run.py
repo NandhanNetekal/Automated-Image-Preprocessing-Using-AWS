@@ -4,8 +4,12 @@ import uuid
 from io import BytesIO
 
 from flask import (
-    Flask, render_template, request,
-    redirect, url_for, flash
+    Flask,
+    render_template,
+    request,
+    redirect,
+    url_for,
+    flash
 )
 
 from werkzeug.utils import secure_filename
@@ -22,6 +26,7 @@ from app.services.s3_service import (
     list_processed_images,
     generate_download_url,
     get_image_metadata,
+    get_original_filename,
     delete_image,
     s3_client,
     BUCKET_NAME
@@ -30,9 +35,14 @@ from app.services.s3_service import (
 from app.services.db_service import (
     get_db_connection,
     save_image_metadata,
-    save_processing_history
+    replace_processing_history,
+    get_processing_history_keys
 )
 
+
+# --------------------------------------------------
+# FLASK CONFIGURATION
+# --------------------------------------------------
 
 load_dotenv()
 
@@ -68,18 +78,22 @@ def home():
 
         try:
             image = Image.open(file.stream)
+
             image_format = image.format
             width, height = image.size
 
             if image_format not in ALLOWED_FORMATS:
-                flash("Only JPG and PNG images are allowed.", "error")
+                flash(
+                    "Only JPG and PNG images are allowed.",
+                    "error"
+                )
                 return redirect(url_for("home"))
 
             image.verify()
 
             extension, content_type = ALLOWED_FORMATS[image_format]
-            original_name = secure_filename(file.filename)
 
+            original_name = secure_filename(file.filename)
             filename = f"{uuid.uuid4().hex}.{extension}"
 
             # Read image bytes
@@ -92,7 +106,8 @@ def home():
             upload_image(
                 BytesIO(image_bytes),
                 filename,
-                content_type
+                content_type,
+                original_name
             )
 
             # Save image metadata in MySQL
@@ -119,12 +134,13 @@ def home():
 
         except Exception:
             app.logger.exception("Image upload failed")
+
             flash(
                 "Image upload failed. Please check the server logs.",
                 "error"
             )
 
-        return redirect(url_for("home"))
+        return redirect(url_for("dashboard"))
 
     images = [
         {
@@ -134,7 +150,10 @@ def home():
         for key in list_images()
     ]
 
-    return render_template("index.html", images=images)
+    return render_template(
+        "index.html",
+        images=images
+    )
 
 
 # --------------------------------------------------
@@ -143,22 +162,16 @@ def home():
 
 @app.route("/process/<filename>", methods=["POST"])
 def process_uploaded_image(filename):
-
     try:
-
-        # Download original image from AWS S3
         response = s3_client.get_object(
             Bucket=BUCKET_NAME,
             Key=f"uploads/{filename}"
         )
-
         image_bytes = response["Body"].read()
 
-        # Get original image dimensions
         original_image = Image.open(BytesIO(image_bytes))
         width, height = original_image.size
 
-        # Find the original image ID in MySQL
         connection = get_db_connection()
         image_id = None
 
@@ -169,22 +182,13 @@ def process_uploaded_image(filename):
                         "SELECT id FROM images WHERE filename = %s",
                         (filename,)
                     )
-
                     result = cursor.fetchone()
-
                     if result:
                         image_id = result["id"]
-
+            finally:
                 connection.close()
 
-            except Exception:
-                connection.close()
-                raise
-
-        # Register older S3 images that were uploaded
-        # before MySQL integration
         if image_id is None:
-
             image_id = save_image_metadata(
                 filename,
                 f"uploads/{filename}",
@@ -193,52 +197,63 @@ def process_uploaded_image(filename):
                 height
             )
 
-        # Apply preprocessing operations
-        processed_images = process_image(image_bytes)
+        selected_operations = request.form.getlist("operations")
+        valid_operations = {"grayscale", "resized", "blurred", "enhanced"}
+        selected_operations = [
+            operation for operation in selected_operations
+            if operation in valid_operations
+        ]
 
-        history_saved = True
+        if not selected_operations:
+            flash(
+                "Please select at least one processing operation.",
+                "warning"
+            )
+            return redirect(url_for("dashboard"))
 
-        # Upload processed images to S3 and save history in MySQL
+        processed_images = process_image(image_bytes, selected_operations)
+
+        if not processed_images:
+            flash("No processed images were generated.", "warning")
+            return redirect(url_for("dashboard"))
+
+        original_name = filename.rsplit(".", 1)[0]
+        history_records = []
+
         for operation, processed_image in processed_images.items():
-
-            processed_filename = (
-                f"{filename.rsplit('.', 1)[0]}_{operation}.png"
-            )
-
-            processed_s3_key = f"processed/{processed_filename}"
-
-            # Upload processed image to S3
-            upload_processed_image(
-                processed_image,
-                processed_filename
-            )
-
-            # Save processing history in MySQL
-            if image_id:
-
-                saved = save_processing_history(
-                    image_id,
-                    operation,
-                    processed_filename,
-                    processed_s3_key
+            for extension in ("png", "jpg"):
+                old_key = f"processed/{original_name}_{operation}.{extension}"
+                s3_client.delete_object(
+                    Bucket=BUCKET_NAME,
+                    Key=old_key
                 )
 
-                if not saved:
-                    history_saved = False
+            processed_filename = f"{original_name}_{operation}.jpg"
+            processed_s3_key = f"processed/{processed_filename}"
 
-            else:
-                history_saved = False
+            upload_processed_image(
+                processed_image,
+                processed_filename,
+                original_size_bytes=len(image_bytes)
+            )
 
-        if history_saved:
+            history_records.append({
+                "operation": operation,
+                "processed_filename": processed_filename,
+                "processed_s3_key": processed_s3_key
+            })
+
+        if image_id and replace_processing_history(image_id, history_records):
             flash(
                 "Image preprocessing completed successfully! "
-                "Processing history saved in MySQL.",
+                "The dashboard now shows only the operations selected "
+                "in this processing run.",
                 "success"
             )
         else:
             flash(
-                "Image preprocessing completed, but some database "
-                "records could not be saved.",
+                "Images were processed and uploaded, but the latest "
+                "processing selection could not be saved in MySQL.",
                 "warning"
             )
 
@@ -251,10 +266,6 @@ def process_uploaded_image(filename):
 
     return redirect(url_for("dashboard"))
 
-
-# --------------------------------------------------
-# DELETE IMAGE FROM S3 AND MYSQL
-# --------------------------------------------------
 
 @app.route("/delete/<filename>", methods=["POST"])
 def delete_uploaded_image(filename):
@@ -302,6 +313,7 @@ def delete_uploaded_image(filename):
 
     except Exception:
         app.logger.exception("Image deletion failed")
+
         flash(
             "Image deletion failed. Check server logs.",
             "error"
@@ -321,18 +333,23 @@ def dashboard():
     images = [
         {
             "filename": key.split("/")[-1],
+            "display_name": get_original_filename(key),
             "url": generate_image_url(key),
             **get_image_metadata(key)
         }
         for key in list_images()
     ]
 
-    # Get processed images from S3
-    processed_keys = list_processed_images()
+    # Show only processed files recorded for the latest run of each image.
+    all_processed_keys = list(dict.fromkeys(list_processed_images()))
+    latest_processed_keys = get_processing_history_keys()
+    processed_keys = [
+        key for key in all_processed_keys
+        if key in latest_processed_keys
+    ]
 
     # Dashboard summary statistics
     total_uploaded = len(images)
-
     total_processed = len(processed_keys)
 
     total_storage = 0
@@ -363,6 +380,14 @@ def dashboard():
         original_filename = image["filename"]
         original_name = original_filename.rsplit(".", 1)[0]
 
+        # Get original image size directly from S3
+        original_metadata = s3_client.head_object(
+            Bucket=BUCKET_NAME,
+            Key=f"uploads/{original_filename}"
+        )
+
+        original_size_bytes = original_metadata["ContentLength"]
+
         outputs = []
 
         for key in processed_keys:
@@ -387,14 +412,52 @@ def dashboard():
                     operation.replace("_", " ").title()
                 )
 
+                # Get processed image size directly from S3
+                processed_metadata = s3_client.head_object(
+                    Bucket=BUCKET_NAME,
+                    Key=key
+                )
+
+                processed_size_bytes = processed_metadata["ContentLength"]
+
+                # Calculate actual file-size reduction percentage
+                if original_size_bytes > 0:
+
+                    size_change_percent = round(
+                        (
+                            (original_size_bytes - processed_size_bytes)
+                            / original_size_bytes
+                        ) * 100,
+                        2
+                    )
+
+                else:
+                    size_change_percent = 0
+
+                output_metadata = get_image_metadata(key)
+
                 outputs.append({
                     "filename": processed_filename,
+                    "display_name": operation_label,
                     "operation": operation_label,
                     "url": generate_image_url(key),
                     "download_url": generate_download_url(key),
-                    **get_image_metadata(key)
+                    "size_change_percent": abs(size_change_percent),
+                    "size_change_label": (
+                        "Size Reduction"
+                        if size_change_percent >= 0
+                        else "Size Increase"
+                    ),
+                    "size_change_text": (
+                        f"{'Size Reduction' if size_change_percent >= 0 else 'Size Increase'}: "
+                        f"{abs(size_change_percent)}%"
+                    ),
+                    "original_size_bytes": original_size_bytes,
+                    "processed_size_bytes": processed_size_bytes,
+                    **output_metadata
                 })
 
+        # Add original image and its processed outputs
         comparison_groups.append({
             "original": {
                 **image,
@@ -402,12 +465,16 @@ def dashboard():
                     f"uploads/{original_filename}"
                 )
             },
+
             "outputs": outputs
         })
 
+    # Render dashboard
     return render_template(
         "dashboard.html",
+
         images=images,
+
         processed_images=[
             {
                 "filename": key.split("/")[-1],
@@ -416,7 +483,9 @@ def dashboard():
             }
             for key in processed_keys
         ],
+
         comparison_groups=comparison_groups,
+
         total_uploaded=total_uploaded,
         total_processed=total_processed,
         storage_mb=storage_mb,
